@@ -28,7 +28,8 @@ requires:
   MooseX::Types: 0
   Storable: 0
   Test::More: 0.88
+  autodie: 0
   perl: 5.008001
 resources:
   repository: https://github.com/tsee/Data-FlexSerializer
-version: 1.03
+version: 1.04

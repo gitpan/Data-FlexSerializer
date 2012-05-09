@@ -7,7 +7,7 @@ use MooseX::Types -declare => [ qw(
 ) ];
 use autodie;
 
-our $VERSION = '1.04';
+our $VERSION = '1.05';
 
 # Get the DEBUG constant from $Data::FlexSerializer::DEBUG or
 # $ENV{DATA_FLEXSERIALIZER_DEBUG}
@@ -205,6 +205,8 @@ sub deserialize_from_file {
   open my $fh, '<', $file;
   local $/;
   my $data = <$fh>;
+  close $fh or die "Error closing file handle: $!";
+
   my ($rv) = $self->deserialize($data);
   return $rv;
 }
@@ -220,7 +222,36 @@ sub serialize_to_file {
 
   open my $fh, '>', $file;
   print $fh $self->serialize($data);
-  close $fh;
+  close $fh or die "Error closing file handle: $!";
+
+  return 1;
+}
+
+sub deserialize_from_fh {
+  my $self = shift;
+  my $fd = shift;
+
+  if (not defined $fd) {
+    Carp::croak("Need file descriptor argument");
+  }
+
+  local $/;
+  my $data = <$fd>;
+  my ($rv) = $self->deserialize($data);
+
+  return $rv;
+}
+
+sub serialize_to_fh {
+  my $self = shift;
+  my $data = shift;
+  my $fd = shift;
+
+  if (not defined $fd) {
+    Carp::croak("Need file descriptor argument");
+  }
+
+  print $fd $self->serialize($data);
 
   return 1;
 }

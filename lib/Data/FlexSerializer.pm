@@ -7,7 +7,7 @@ use MooseX::Types -declare => [ qw(
 ) ];
 use autodie;
 
-our $VERSION = '1.05';
+our $VERSION = '1.06';
 
 # Get the DEBUG constant from $Data::FlexSerializer::DEBUG or
 # $ENV{DATA_FLEXSERIALIZER_DEBUG}
@@ -338,6 +338,10 @@ C<output_format> can be either set to the string C<json> (default) or C<storable
 It has the obvious effect. Its value can be changed at runtime via the accessor
 to facilitate having certain output formats in experiments.
 
+C<detect_storable>, if set, forces C<Data::FlexSerializer> into
+Storable-compatibility mode. Apart from JSON input, it will also detect whether
+the provided blob is in valid Storable format. Defaults to off.
+
 =head2 serialize
 
 Given a list of things to serialize, this does the job on each of them and
@@ -378,6 +382,8 @@ Steffen Mueller <smueller@cpan.org>
 Burak Gürsoy <burak@cpan.org>
 
 Elizabeth Matthijsen <liz@dijkmat.nl>
+
+Caio Romão Costa Nascimento <cpan@caioromao.com>
 
 =head1 ACKNOWLEDGMENT
 

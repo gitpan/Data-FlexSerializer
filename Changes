@@ -1,5 +1,16 @@
 Revision history for Perl extension Data::FlexSerializer
 
+1.08 Mon Nov  5 13:35:50 UTC 2012
+
+ - Dynamically changing the output_format without a custom
+   serial_encoder didn't work if the output format was set to
+   'sereal'.
+
+   Now we'll dynamically construct a Sereal::Encoder object if needed
+   if the output format changes from e.g. Storable to Sereal.
+
+ - Change the POD tagline to include Sereal.
+
 1.07 Fri Nov  2 14:59:07 CET 2012
 
  - Add support for the Sereal format. This adds a dependency on

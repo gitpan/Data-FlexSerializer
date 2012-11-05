@@ -1,7 +1,7 @@
 --- #YAML:1.0
 name:               Data-FlexSerializer
-version:            1.07
-abstract:           (De-)serialization from/to (compressed) JSON or Storable
+version:            1.08
+abstract:           (De-)serialization from/to (compressed) JSON, Storable or Sereal
 author:
     - Steffen Mueller <smueller@cpan.org>
 license:            perl

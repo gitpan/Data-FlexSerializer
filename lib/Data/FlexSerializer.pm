@@ -1,13 +1,15 @@
 package Data::FlexSerializer;
 use Moose;
-use Moose::Util::TypeConstraints qw(enum);
-use MooseX::Types::Moose qw(Maybe Bool Int Str Object);
+use MooseX::ClassAttribute;
+use MooseX::Types::Moose qw(ArrayRef HashRef Maybe Bool Int Str Object CodeRef);
+use MooseX::Types::Structured qw(Dict Tuple Map);
 use MooseX::Types -declare => [ qw(
-    DataFlexSerializerOutputFormats
+    FormatHandler
+    FormatBool
 ) ];
 use autodie;
 
-our $VERSION = '1.08';
+our $VERSION = '1.09';
 
 # Get the DEBUG constant from $Data::FlexSerializer::DEBUG or
 # $ENV{DATA_FLEXSERIALIZER_DEBUG}
@@ -22,6 +24,81 @@ use Compress::Zlib qw(Z_DEFAULT_COMPRESSION);
 use IO::Uncompress::AnyInflate qw();
 use Carp ();
 use Data::Dumper qw(Dumper);
+
+subtype FormatHandler,
+  as Dict [
+      detect      => CodeRef,
+      serialize   => CodeRef,
+      deserialize => CodeRef,
+  ],
+  message { 'A format needs to be passed as an hashref with "serialize", "deserialize" and "detect" keys that point to a coderef to perform the respective action' };
+
+subtype FormatBool,
+  as Map[Str, Bool];
+
+coerce FormatBool,
+  from ArrayRef,
+    via { { map lc $_ => 1, @$_ } },
+  from Str,
+    via { { lc $_ => 1 } },
+;
+
+class_has formats => (
+    traits   => ['Hash'],
+    is      => 'rw',
+    isa     => HashRef[FormatHandler],
+    default => sub {
+        {
+            json => {
+                detect      => sub { $_[1] =~ /^(?:\{|\[)/ },
+                serialize   => sub { shift; goto \&JSON::XS::encode_json },
+                deserialize => sub { shift; goto \&JSON::XS::decode_json },
+            },
+            storable => {
+                detect      => sub { $_[1] =~ s/^pst0// }, # this is not a real detector.
+                                                           # It just removes the storable
+                                                           # file magic if necessary.
+                                                           # Tho' storable needs to be last
+                serialize   => sub { shift; goto \&Storable::nfreeze },
+                deserialize => sub { shift; goto \&Storable::thaw },
+            },
+            sereal => {
+                detect      => sub { shift->{sereal_decoder}->looks_like_sereal(@_) },
+                serialize   => sub { shift->{sereal_encoder}->encode(@_) },
+                deserialize => sub { my $structure; shift->{sereal_decoder}->decode($_[0], $structure); $structure },
+            },
+        }
+    },
+    handles => {
+        add_format        => 'set',
+        get_format        => 'get',
+        has_format        => 'exists',
+        supported_formats => 'keys',
+    },
+);
+
+has output_format => (
+    is      => 'rw',
+    isa     => Str,
+    default => 'json',
+);
+
+has detect_formats => (
+    traits  => ['Hash'],
+    is      => 'rw',
+    isa     => FormatBool,
+    default => sub { { json => 1, sereal => 0, storable => 0 } },
+    coerce  => 1,
+    handles => {
+        detect_json     => [ get => 'json' ],
+        detect_storable => [ get => 'storable' ],
+        detect_sereal   => [ get => 'sereal' ],
+        _set_detect_json     => [ set => 'json' ],
+        _set_detect_storable => [ set => 'storable' ],
+        _set_detect_sereal   => [ set => 'sereal' ],
+        list_detect_formats  => 'kv',
+    }
+);
 
 has assume_compression => (
     is      => 'ro',
@@ -44,35 +121,6 @@ has compress_output => (
 has compression_level => (
     is      => 'ro',
     isa     => Maybe[Int],
-);
-
-has detect_storable => (
-    is      => 'ro',
-    isa     => Bool,
-    default => 0,
-);
-
-has detect_sereal => (
-    is      => 'ro',
-    isa     => Bool,
-    default => 0,
-);
-
-enum DataFlexSerializerOutputFormats, [ qw(
-    storable
-    json
-    sereal
-) ];
-
-coerce DataFlexSerializerOutputFormats,
-    from Str,
-    via { lc $_ };
-
-has output_format => (
-    is      => 'rw',
-    isa     => DataFlexSerializerOutputFormats,
-    default => 'json',
-    coerce  => 1,
 );
 
 has sereal_encoder => (
@@ -105,6 +153,41 @@ around BUILDARGS => sub {
         die "Can't assume compression and auto-detect compression at the same time. That makes no sense.";
     }
 
+    my %detect_formats = map {
+        exists $args{"detect_$_"} ? ($_ => $args{"detect_$_"}) : ()
+    } $class->supported_formats;
+
+    if (%detect_formats) {
+        if ($args{detect_formats}) {
+            $args{detect_formats} = [ $args{detect_formats} ] unless ref $args{detect_formats};
+            if (ref $args{detect_formats} eq 'ARRAY') {
+                for my $format (@{$args{detect_formats}}) {
+                    die "Can't have $format in detect_formats and detect_$format set to false at the same time"
+                      if exists $detect_formats{$format} && !$detect_formats{$format};
+                    $detect_formats{$format} = 1;
+                }
+            } else {
+                for my $format (keys %{$args{detect_formats}}) {
+                    die "Can't have $format in detect_formats and detect_$format set to false at the same time"
+                      if exists $detect_formats{$format}
+                      && exists $args{detect_formats}{$format}
+                      && $detect_formats{$format} != $args{detect_formats}{$format};
+                    $detect_formats{$format} = 1;
+                }
+            }
+        } else {
+            $args{detect_formats} = \%detect_formats;
+        }
+    }
+
+    $args{output_format} = lc $args{output_format} if $args{output_format};
+
+    for my $format (
+      ( $args{output_format}  ? $args{output_format}          : () ),
+      ( $args{detect_formats} ? keys %{$args{detect_formats}} : () )) {
+        die "'$format' is not a supported format" unless $class->has_format($format);
+    }
+
     my $rv = $class->$orig(%args);
 
     if (DEBUG) {
@@ -117,223 +200,247 @@ around BUILDARGS => sub {
 sub BUILD {
     my ($self) = @_;
 
-    # We may or may not have Sereal::{Decoder,Encoder} objects, if not
-    # build them
+    # build Sereal::{Decoder,Encoder} objects if necessary
     $self->sereal_decoder if $self->detect_sereal;
     $self->sereal_encoder if $self->output_format eq 'sereal';
+
+    # For legacy reasons json should be on by default
+    $self->_set_detect_json(1) unless defined $self->detect_json;
+
+    $self->{serializer_coderef}   = $self->make_serializer;
+    $self->{deserializer_coderef} = $self->make_deserializer;
 
     return;
 }
 
-sub serialize {
-  my $self = shift;
+sub serialize   { goto $_[0]->{serializer_coderef} }
+sub deserialize { goto $_[0]->{deserializer_coderef} }
 
-  my $do_compress = $self->{compress_output}; # hot path, bypass accessor
-  my $output_format = $self->{output_format}; # hot path, bypass accessor
-  my $comp_level;
-  $comp_level = $self->{compression_level} if $do_compress; # hot path, bypass accessor
+sub make_serializer {
+    my $self = shift;
+    my $compress_output = $self->compress_output;
+    my $output_format = $self->output_format;
+    my $comp_level;
+    $comp_level = $self->compression_level if $compress_output;
 
-  if (DEBUG) {
-    warn(sprintf(
-      "FlexSerializer using the following options for serialization: "
-      . "compress_output=%s, compression_level=%s, output_format=%s",
-      map {defined $self->{$_} ? $self->{$_} : '<undef>'}
-      qw(compress_output compression_level output_format)
-    ));
-  }
-
-  if ($output_format eq 'sereal' && !$self->{sereal_encoder}) {
-    # We don't use the sereal_encoder accessor here for speed, and
-    # since output_format is rw someone may change this to 'sereal'
-    # dynamically, in which case we'll have to construct a new
-    # emitter.
-    $self->sereal_encoder;
-  }
-
-  my @out;
-  foreach my $data (@_) {
-    my $serialized = $output_format eq 'json'
-                   ? JSON::XS::encode_json($data)
-                   : $output_format eq 'storable'
-                     ? Storable::nfreeze($data)
-                     : $output_format eq 'sereal'
-                       ? $self->{sereal_encoder}->encode($data)
-                       : die "PANIC: unknown output format '$output_format'";
-    if ($do_compress) {
-      $serialized = Compress::Zlib::compress(\$serialized,
-                                             (defined($comp_level) ? ($comp_level) : (Z_DEFAULT_COMPRESSION)));
+    if (DEBUG) {
+        warn(sprintf(
+            "FlexSerializer using the following options for serialization: "
+            . "compress_output=%s, compression_level=%s, output_format=%s",
+            map {defined $self->{$_} ? $self->{$_} : '<undef>'}
+            qw(compress_output compression_level output_format)
+        ));
     }
-    push @out, $serialized;
-  }
 
-  return wantarray ? @out
-       : @out >  1 ? die( sprintf 'You have %d serialized structures, please call this method in list context', scalar @out )
-       :            $out[0];
+    {
+        no strict 'refs';
+        my $class = ref $self;
+        *{"$class\::__serialize_$output_format"} =
+          $self->get_format($output_format)->{serialize}
+            or die "PANIC: unknown output format '$output_format'";
+    }
+
+    my $code = "__serialize_$output_format(\$self, \$_)";
+
+    if ($compress_output) {
+        my $comp_level_code = defined $comp_level ? $comp_level : 'Z_DEFAULT_COMPRESSION';
+        $code = "Compress::Zlib::compress(\\$code,$comp_level_code)";
+    }
+
+    $code = sprintf q{
+        sub {
+          # local *__ANON__= "__ANON__serialize__";
+          my $self = shift;
+
+          my @out;
+          push @out, %s for @_;
+
+          return wantarray ? @out
+               : @out >  1 ? die( sprintf "You have %%d serialized structures, please call this method in list context", scalar @out )
+               :            $out[0];
+
+          return @out;
+        };
+    }, $code;
+
+    warn $code if DEBUG >= 2;
+
+    my $coderef = eval $code or do{
+        my $error = $@ || 'Zombie error';
+        die "Couldn't create the deserialization coderef: $error\n The code is: $code\n";
+    };
+
+    return $coderef;
 }
 
-sub deserialize {
-  my $self = shift;
+sub make_deserializer {
+    my $self = shift;
 
-  my $do_uncompress = $self->{assume_compression}; # hot path, bypass accessor
-  my $detect_compression = $self->{detect_compression}; # hot path, bypass accessor
-  my $detect_storable = $self->{detect_storable}; # hot path, bypass accessor
-  my $detect_sereal = $self->{detect_sereal}; # hot path, bypass accessor
-  my $sereal_decoder = $detect_sereal ? $self->{sereal_decoder} : undef;
+    my $assume_compression = $self->assume_compression;
+    my $detect_compression = $self->detect_compression;
 
-  if (DEBUG) {
-    warn(sprintf(
-      "FlexSerializer using the following options for deserialization: "
-      . "assume_compression=%s, detect_compression=%s, detect_storable=%s, detect_sereal=%s\n",
-      map {defined $self->{$_} ? $self->{$_} : '<undef>'}
-      qw(assume_compression detect_compression detect_storable detect_sereal)
-    ));
-  }
+    my %detectors = %{$self->detect_formats};
 
-  my @out;
-  foreach my $serialized (@_) {
-    my $uncompr;
-    if ($do_uncompress) {
-      $uncompr = Compress::Zlib::uncompress(\$serialized);
-      unless (defined $uncompr) {
-        die "You've told me to assume compression but calling uncompress() on your input string returns undef";
-      }
+    # Move storable to the end of the detectors list.
+    # We don't know how to detect it.
+    delete $detectors{storable} if exists $detectors{storable};
+    my @detectors = grep $detectors{$_}, $self->supported_formats;
+    push @detectors, 'storable' if $self->detect_storable;
+
+    if (DEBUG) {
+        warn "Detectors: @detectors";
+        warn("FlexSerializer using the following options for deserialization: ",
+            join ', ', (map {defined $self->$_ ? "$_=@{[$self->$_]}" : "$_=<undef>"}
+            qw(assume_compression detect_compression)),
+            map { "detect_$_->[0]=$_->[1]" } $self->list_detect_formats
+        );
+    }
+
+    my $uncompress_code;
+    if ($assume_compression) {
+        $uncompress_code = '
+        local $_ = Compress::Zlib::uncompress(\$serialized);
+        unless (defined $_) {
+            die "You\'ve told me to assume compression but calling uncompress() on your input string returns undef";
+        }';
     }
     elsif ($detect_compression) {
-      my $inflatedok = IO::Uncompress::AnyInflate::anyinflate(\$serialized => \$uncompr);
-      warn "FlexSerializer: Detected that the input was " . ($inflatedok ? "" : "not ") . "compressed"
-        if DEBUG;
-      if (not $inflatedok) {
-        $uncompr = $serialized;
-      }
+        $uncompress_code = '
+        local $_;
+        my $inflatedok = IO::Uncompress::AnyInflate::anyinflate(\$serialized => \$_);
+        warn "FlexSerializer: Detected that the input was " . ($inflatedok ? "" : "not ") . "compressed"
+            if DEBUG >= 3;
+        $_ = $serialized if not $inflatedok;';
     }
     else {
-      $uncompr = $serialized;
+        warn "FlexSerializer: Not using compression" if DEBUG;
+        $uncompress_code = '
+        local $_ = $serialized;';
     }
 
-    # Copy-paste galore ahead for performance reasons. We can either
-    # make it pruttah or fast.
-    if ($detect_sereal) {
-      if ($sereal_decoder->looks_like_sereal($uncompr)) {
-        warn "FlexSerializer: Detected that the input was Sereal" if DEBUG;
-        warn "FlexSerializer: This was the Sereal input: '%s'",
-              substr($uncompr, 0, min(length($uncompr), 100)) if DEBUG >= 2;
-        my $structure;
-        $sereal_decoder->decode($uncompr, $structure);
-        push @out, $structure;
-      }
-      elsif ($detect_storable) {
-        if ($uncompr =~ /^(?:\{|\[)/) {
-          warn "FlexSerializer: Detected that the input was JSON" if DEBUG;
-          warn "FlexSerializer: This was the start of the JSON input: '%s'",
-                substr($uncompr, 0, min(length($uncompr), 100)) if DEBUG >= 2;
-          push @out, JSON::XS::decode_json($uncompr);
-        }
-        else {
-        #elsif (defined Storable::read_magic(substr($uncompr, 0, 21))) {
-          warn "FlexSerializer: Detected that the input was Storable" if DEBUG;
-          warn "FlexSerializer: This was the Storable input: '%s'",
-                substr($uncompr, 0, min(length($uncompr), 100)) if DEBUG >= 2;
-          $uncompr =~ s/^pst0//; # remove Storable file magic if necessary
-          push @out, Storable::thaw($uncompr);
-        }
-      }
-      else {
-        warn "FlexSerializer: Assuming that the input is JSON" if DEBUG;
-        warn "FlexSerializer: This was the JSON input: '%s'",
-             substr($uncompr, 0, min(length($uncompr), 100)) if DEBUG >= 2;
-        push @out, JSON::XS::decode_json($uncompr);
-      }
-    } else {
-      if ($detect_storable) {
-        if ($uncompr =~ /^(?:\{|\[)/) {
-          warn "FlexSerializer: Detected that the input was JSON" if DEBUG;
-          warn "FlexSerializer: This was the start of the JSON input: '%s'",
-                substr($uncompr, 0, min(length($uncompr), 100)) if DEBUG >= 2;
-          push @out, JSON::XS::decode_json($uncompr);
-        }
-        else {
-        #elsif (defined Storable::read_magic(substr($uncompr, 0, 21))) {
-          warn "FlexSerializer: Detected that the input was Storable" if DEBUG;
-          warn "FlexSerializer: This was the Storable input: '%s'",
-                substr($uncompr, 0, min(length($uncompr), 100)) if DEBUG >= 2;
-          $uncompr =~ s/^pst0//; # remove Storable file magic if necessary
-          push @out, Storable::thaw($uncompr);
-        }
-      }
-      else {
-        warn "FlexSerializer: Assuming that the input is JSON" if DEBUG;
-        warn "FlexSerializer: This was the JSON input: '%s'",
-             substr($uncompr, 0, min(length($uncompr), 100)) if DEBUG >= 2;
-        push @out, JSON::XS::decode_json($uncompr);
-      }
+    my $code_detect = q!
+        warn "FlexSerializer: %2$s that the input was %1$s" if DEBUG >= 3;
+        warn sprintf "FlexSerializer: This was the %1$s input: '%s'",
+            substr($_, 0, min(length($_), 100)) if DEBUG >= 3;
+        push @out, __deserialize_%1$s($self, $_)!;
+
+    my $detector = '__detect_%1$s($self, $_)';
+    my $body     = "\n$code_detect\n    }";
+
+    my $code = @detectors == 1
+        # Just one detector => skip the if()else gobbledigook
+        ? sprintf $code_detect, $detectors[0], 'Assuming'
+        # Multiple detectors
+        : join('', map {
+              sprintf(
+                  ($_ == 0           ? "if ( $detector ) { $body"
+                  :$_ == $#detectors ? " else { $detector; $body"
+                  :                    " elsif ( $detector ) { $body"),
+                  $detectors[$_],
+                  ($_ == $#detectors ? 'Assuming' : 'Detected'),
+              );
+          } 0..$#detectors
+        );
+
+    $code = sprintf(q{
+        sub {
+          # local *__ANON__= "__ANON__deserialize__";
+          my $self = shift;
+
+          my @out;
+          for my $serialized (@_) {
+            %s
+
+            %s
+          }
+
+          return wantarray ? @out
+               : @out >  1 ? die( sprintf "You have %%d deserialized structures, please call this method in list context", scalar @out )
+               :            $out[0];
+
+          return @out;
+        };},
+        $uncompress_code, $code
+    );
+
+    warn $code if DEBUG >= 2;
+
+    # inject the deserializers and detectors in the symbol table
+    # before we eval the code.
+    for (@detectors) {
+        my $class = ref $self;
+        no strict 'refs';
+        my $format = $self->get_format($_);
+        *{"$class\::__deserialize_$_"} = $format->{deserialize};
+        *{"$class\::__detect_$_"} = $format->{detect};
     }
-  }
 
-  return wantarray ? @out
-       : @out >  1 ? die( sprintf 'You have %d deserialized structures, please call this method in list context', scalar @out )
-       :            $out[0];
+    my $coderef = eval $code or do{
+        my $error = $@ || 'Clobbed';
+        die "Couldn't create the deserialization coderef: $error\n The code is: $code\n";
+    };
 
-  return @out;
+    return $coderef;
 }
 
 sub deserialize_from_file {
-  my $self = shift;
-  my $file = shift;
+    my $self = shift;
+    my $file = shift;
 
-  if (not defined $file or not -r $file) {
-    Carp::croak("Need filename argument or can't read file");
-  }
+    if (not defined $file or not -r $file) {
+        Carp::croak("Need filename argument or can't read file");
+    }
 
-  open my $fh, '<', $file;
-  local $/;
-  my $data = <$fh>;
-  my ($rv) = $self->deserialize($data);
-  return $rv;
+    open my $fh, '<', $file;
+    local $/;
+    my $data = <$fh>;
+    my ($rv) = $self->deserialize($data);
+    return $rv;
 }
 
 sub serialize_to_file {
-  my $self = shift;
-  my $data = shift;
-  my $file = shift;
+    my $self = shift;
+    my $data = shift;
+    my $file = shift;
 
-  if (not defined $file) {
-    Carp::croak("Need filename argument");
-  }
+    if (not defined $file) {
+        Carp::croak("Need filename argument");
+    }
 
-  open my $fh, '>', $file;
-  print $fh $self->serialize($data);
-  close $fh;
+    open my $fh, '>', $file;
+    print $fh $self->serialize($data);
+    close $fh;
 
-  return 1;
+    return 1;
 }
 
 sub deserialize_from_fh {
-  my $self = shift;
-  my $fd = shift;
+    my $self = shift;
+    my $fd = shift;
 
-  if (not defined $fd) {
-    Carp::croak("Need file descriptor argument");
-  }
+    if (not defined $fd) {
+        Carp::croak("Need file descriptor argument");
+    }
 
-  local $/;
-  my $data = <$fd>;
-  my ($rv) = $self->deserialize($data);
+    local $/;
+    my $data = <$fd>;
+    my ($rv) = $self->deserialize($data);
 
-  return $rv;
+    return $rv;
 }
 
 sub serialize_to_fh {
-  my $self = shift;
-  my $data = shift;
-  my $fd = shift;
+    my $self = shift;
+    my $data = shift;
+    my $fd = shift;
 
-  if (not defined $fd) {
-    Carp::croak("Need file descriptor argument");
-  }
+    if (not defined $fd) {
+        Carp::croak("Need file descriptor argument");
+    }
 
-  print $fd $self->serialize($data);
+    print $fd $self->serialize($data);
 
-  return 1;
+    return 1;
 }
 
 
@@ -405,7 +512,7 @@ longer the recommended way to use it.
     output_format => 'sereal',
   );
 
-=head2 Migrate date from Sereal to JSON
+=head2 Migrate from Sereal to JSON
 
   my $sereal_backcompat = Data::FlexSerializer->new(
     detect_sereal => 1, # accept Sereal images as input
@@ -415,6 +522,7 @@ longer the recommended way to use it.
 
   my $flex_to_json = Data::FlexSerializer->new(
     detect_compression => 1,
+    detect_json => 1, # this is the default
     detect_sereal => 1,
     detect_storable => 1,
     output_format => 'sereal',
@@ -424,6 +532,7 @@ longer the recommended way to use it.
 
   my $flex_to_json = Data::FlexSerializer->new(
     detect_compression => 1,
+    detect_json => 1, # this is the default
     detect_sereal => 1,
     detect_storable => 1,
     output_format => 'sereal',
@@ -448,6 +557,25 @@ detect that the input data is a (compressed or uncompressed) Storable
 image and handle it gracefully. This flexibility comes at a price in
 performance, so in order to keep the impact low, the default options
 are more restrictive, see below.
+
+=head1 CLASS METHODS
+
+=head3 add_format
+
+C<add_format> class method to add support for custom formats.
+
+  Data::FlexSerializer->add_format(
+      data_dumper => {
+          serialize   => sub { shift; goto \&Data::Dumper::Dumper },
+          deserialize => sub { shift; goto \&eval },
+          detect      => sub { $_[1] =~ /\$[\w]+\s*=/ },
+      }
+  );
+
+  my $flex_to_dd = Data::FlexSerializer->new(
+    detect_data_dumper => 1,
+    output_format => 'data_dumper',
+  );
 
 =head1 METHODS
 
@@ -490,6 +618,11 @@ first call to L</serialize> after that will dynamically construct a
 L<Sereal::Encoder> object, to avoid this supply a custom
 L</sereal_encoder> object when constructing the object, and we won't
 have to construct it dynamically later.
+
+=head3 detect_json
+
+C<detect_json>, if set, forces C<Data::FlexSerializer> into
+JSON-compatibility mode. Defaults to on. 
 
 =head3 detect_storable
 
@@ -557,16 +690,18 @@ Elizabeth Matthijsen <liz@dijkmat.nl>
 
 Caio Romão Costa Nascimento <cpan@caioromao.com>
 
+Jonas Galhordas Duarte Alves <jgda@cpan.org>
+
 =head1 ACKNOWLEDGMENT
 
-This module was originally developed at and for booking.com.
-With approval from booking.com, this module was generalized
+This module was originally developed at and for Booking.com.
+With approval from Booking.com, this module was generalized
 and put on CPAN, for which the authors would like to express
 their gratitude.
 
 =head1 COPYRIGHT AND LICENSE
 
- (C) 2011, 2012 Steffen Mueller and others. All rights reserved.
+ (C) 2011, 2012, 2013 Steffen Mueller and others. All rights reserved.
 
  This code is available under the same license as Perl version
  5.8.1 or higher.
